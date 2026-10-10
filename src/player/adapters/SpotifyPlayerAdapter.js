@@ -1,3 +1,5 @@
+import { markPlayback, markPlaying } from "../playbackTiming";
+
 let spotifySdkPromise;
 
 function loadSpotifySdk() {
@@ -43,6 +45,11 @@ export class SpotifyPlayerAdapter {
     this.onStateChange = null;
     this.onStatusChange = null;
     this.lastState = null;
+    this.pendingUri = null;
+    this.playRequest = null;
+    this.progressTimer = null;
+    this.progressBase = null;
+    this.transferred = false;
     this.currentTrackUri = null;
     this.endReported = false;
   }
@@ -121,14 +128,16 @@ export class SpotifyPlayerAdapter {
         if (this.readyTimeout !== null) window.clearTimeout(this.readyTimeout);
         this.readyTimeout = null;
         this.deviceId = deviceId;
+        this.transferred = false;
         this.onStatusChange?.("ready");
         this.readyResolver?.(deviceId);
         this.readyResolver = null;
         this.readyRejector = null;
         resolve(deviceId);
       });
-      this.player.addListener("not_ready", () => {
-        if (!this.deviceId) return;
+      this.player.addListener("not_ready", ({ device_id: lostId }) => {
+        // A discarded player's event must not clear the replacement device.
+        if (!this.deviceId || lostId !== this.deviceId) return;
         this.deviceId = null;
         this.initializePromise = null;
         this.onStatusChange?.("loading");
@@ -208,8 +217,9 @@ export class SpotifyPlayerAdapter {
 
     const position = Math.max(0, Number(state.position) || 0);
     const duration = Math.max(0, Number(state.duration) || 0);
-    this.onProgress?.({ currentTime: position / 1000, duration: duration / 1000 });
+    this.syncProgress(position, duration, !state.paused);
     this.onStateChange?.(!state.paused);
+    if (!state.paused && currentUri && currentUri === this.pendingUri) markPlaying("spotify");
 
     const justFinished = this.lastState && !this.lastState.paused && state.paused &&
       duration > 0 && position >= duration - 1000;
@@ -220,22 +230,67 @@ export class SpotifyPlayerAdapter {
     this.lastState = state;
   }
 
+  syncProgress(position, duration, playing) {
+    this.progressBase = { position, duration, at: performance.now() };
+    this.onProgress?.({ currentTime: position / 1000, duration: duration / 1000 });
+    window.clearInterval(this.progressTimer);
+    this.progressTimer = null;
+    if (!playing) return;
+    // The SDK only emits state on changes, so advance the position locally.
+    this.progressTimer = window.setInterval(() => {
+      const { position: base, duration: total, at } = this.progressBase;
+      const elapsed = Math.min(total, base + performance.now() - at);
+      this.onProgress?.({ currentTime: elapsed / 1000, duration: total / 1000 });
+    }, 500);
+  }
+
   async load(track) {
     if (!(track.providerId || track.externalId)) throw new Error("This Spotify track has no ID.");
     await this.initialize();
   }
 
+  async resetPlayer() {
+    try {
+      await this.player?.disconnect();
+    } catch {
+      // The stale instance is being discarded anyway.
+    }
+    this.player = null;
+    this.deviceId = null;
+    this.initializePromise = null;
+    this.transferred = false;
+  }
+
   async play(track) {
     const trackId = track.providerId || track.externalId;
     if (!trackId) throw new Error("This Spotify track has no ID.");
-    const deviceId = await this.initialize();
+    const warm = Boolean(this.deviceId);
+    if (!warm) markPlayback("spotify", "adapter init start");
+    let deviceId = await this.initialize();
+    markPlayback("spotify", warm ? "adapter ready (already warm)" : "adapter ready");
+    this.pendingUri = `spotify:track:${trackId}`;
+    // Must run inside the click gesture so the browser allows audio.
+    await this.player?.activateElement?.();
     this.onStatusChange?.("loading");
-    const response = await fetch("/api/spotify/player/play", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ device_id: deviceId, uri: `spotify:track:${trackId}` }),
-    });
-    const payload = await response.json().catch(() => ({}));
+    markPlayback("spotify", "load + play request sent", { command: true });
+    const send = async () => {
+      const request = fetch("/api/spotify/player/play", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ device_id: deviceId, uri: `spotify:track:${trackId}`, transfer: !this.transferred }),
+      });
+      this.playRequest = request;
+      const result = await request;
+      return { response: result, payload: await result.json().catch(() => ({})) };
+    };
+    let { response, payload } = await send();
+    if (!response.ok && /device not found/i.test(payload.error || "")) {
+      // The SDK device is stale; a fresh player registers a new device.
+      await this.resetPlayer();
+      deviceId = await this.initialize();
+      await this.player?.activateElement?.();
+      ({ response, payload } = await send());
+    }
     if (!response.ok) {
       const details = payload.error || "Unable to start Spotify playback.";
       const error = new Error(/premium/i.test(details)
@@ -244,14 +299,45 @@ export class SpotifyPlayerAdapter {
       this.reportError(error);
       throw error;
     }
+    this.transferred = true;
+    markPlayback("spotify", "request accepted");
     this.currentTrackUri = `spotify:track:${trackId}`;
     this.endReported = false;
     this.onStatusChange?.("ready");
   }
 
-  async pause() { await this.player?.pause(); }
-  async resume() { await this.player?.resume(); }
-  async seek(seconds) { await this.player?.seek(Math.max(0, Number(seconds) || 0) * 1000); }
+  async pause() {
+    await this.control("pause", () => this.player?.pause());
+    const base = this.progressBase;
+    if (base) this.syncProgress(Math.min(base.duration, base.position + performance.now() - base.at), base.duration, false);
+  }
+  async resume() {
+    await this.control("resume", () => this.player?.resume());
+    const base = this.progressBase;
+    if (base) this.syncProgress(base.position, base.duration, true);
+  }
+  async seek(seconds) {
+    const target = Math.max(0, Number(seconds) || 0) * 1000;
+    await this.control("seek", () => this.player?.seek(target), { position_ms: target });
+    const playing = Boolean(this.progressTimer);
+    this.syncProgress(target, this.progressBase?.duration || 0, playing);
+  }
+
+  // Playback may be active on another device, so the SDK alone can't be trusted.
+  async control(action, sdkCall, body = {}) {
+    const [sdk, api] = await Promise.allSettled([
+      sdkCall(),
+      fetch(`/api/spotify/player/${action}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    ]);
+    const apiOk = api.status === "fulfilled" && api.value.ok;
+    if (sdk.status === "rejected" && !apiOk) {
+      throw new Error(`Spotify ${action} failed.`);
+    }
+  }
   async setVolume(value) { await this.player?.setVolume(Math.max(0, Math.min(1, Number(value) / 100))); }
 
   async getCurrentTime() {
@@ -263,7 +349,20 @@ export class SpotifyPlayerAdapter {
   }
 
   async stop() {
-    await this.player?.pause();
+    this.pendingUri = null;
+    window.clearInterval(this.progressTimer);
+    this.progressTimer = null;
+    // A play request still in flight would otherwise start after this pause.
+    await this.playRequest?.catch(() => {});
+    const [sdk, api] = await Promise.allSettled([
+      this.player?.pause(),
+      // Covers playback that is active on a device other than this SDK player.
+      fetch("/api/spotify/player/pause", { method: "POST" }),
+    ]);
+    if (import.meta.env.DEV) {
+      if (sdk.status === "rejected") console.warn("[spotify] SDK pause failed:", sdk.reason?.message);
+      if (api.status === "rejected" || !api.value.ok) console.warn("[spotify] API pause failed:", api.value?.status ?? api.reason?.message);
+    }
     this.onStateChange?.(false);
     this.onProgress?.({ currentTime: 0, duration: 0 });
   }

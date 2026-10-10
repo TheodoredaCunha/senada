@@ -1,3 +1,5 @@
+import { markPlayback, markPlaying } from "../playbackTiming";
+
 let youtubeApiPromise;
 
 function loadYouTubeIframeApi() {
@@ -38,6 +40,7 @@ export class YouTubePlayerAdapter {
     this.onProgress = null;
     this.onStateChange = null;
     this.progressTimer = null;
+    this.ready = false;
   }
 
   setOnEnded(callback) {
@@ -69,8 +72,7 @@ export class YouTubePlayerAdapter {
 
   async createPlayer() {
     const YT = await loadYouTubeIframeApi();
-    await new Promise((resolve) => requestAnimationFrame(resolve));
-    const container = document.getElementById(this.containerId);
+    const container = await this.waitForContainer();
     if (!container) throw new Error("YouTube player container is missing.");
 
     return new Promise((resolve, reject) => {
@@ -78,12 +80,17 @@ export class YouTubePlayerAdapter {
         this.player = new YT.Player(container, {
           width: "356",
           height: "200",
-          playerVars: { playsinline: 1, rel: 0 },
+          playerVars: { playsinline: 1, rel: 0, origin: window.location.origin },
           events: {
-            onReady: () => resolve(),
+            onReady: () => {
+              this.ready = true;
+              resolve();
+            },
             onStateChange: (event) => {
+              if (event.data === YT.PlayerState.BUFFERING) markPlayback("youtube", "buffering");
               if (event.data === YT.PlayerState.PLAYING) {
                 this.onStateChange?.(true);
+                markPlaying("youtube");
                 this.startProgressUpdates();
               } else {
                 this.onStateChange?.(false);
@@ -93,12 +100,14 @@ export class YouTubePlayerAdapter {
               if (event.data === YT.PlayerState.ENDED) this.onEnded?.();
             },
             onError: (event) => {
+              if (import.meta.env.DEV) console.warn(`[youtube] onError code ${event.data} at ${window.location.origin}`);
               const messages = {
                 2: "YouTube rejected the video ID.",
                 5: "This video cannot be played in the embedded player.",
                 100: "This YouTube video is unavailable or has been removed.",
                 101: "The video owner does not allow embedded playback.",
                 150: "The video owner does not allow embedded playback.",
+                153: "YouTube could not verify this page's origin or referrer for embedded playback.",
               };
               const error = new Error(messages[event.data] || "YouTube playback failed.");
               this.stopProgressUpdates();
@@ -113,6 +122,20 @@ export class YouTubePlayerAdapter {
     });
   }
 
+  async waitForContainer(timeoutMs = 5000) {
+    const deadline = performance.now() + timeoutMs;
+    let container = document.getElementById(this.containerId);
+    while (!container && performance.now() < deadline) {
+      await new Promise((resolve) => window.setTimeout(resolve, 50));
+      container = document.getElementById(this.containerId);
+    }
+    return container;
+  }
+
+  async initialize() {
+    await this.ensurePlayer();
+  }
+
   async load(track) {
     const videoId = track.providerId || track.externalId;
     if (!videoId) throw new Error("This YouTube track has no video ID.");
@@ -123,7 +146,11 @@ export class YouTubePlayerAdapter {
   async play(track) {
     const videoId = track.providerId || track.externalId;
     if (!videoId) throw new Error("This YouTube track has no video ID.");
+    const warm = this.ready;
+    if (!warm) markPlayback("youtube", "adapter init start");
     await this.ensurePlayer();
+    markPlayback("youtube", warm ? "adapter ready (already warm)" : "adapter ready");
+    markPlayback("youtube", "load + play command sent", { command: true });
     this.player.loadVideoById(videoId);
   }
 
@@ -153,6 +180,10 @@ export class YouTubePlayerAdapter {
     this.player?.playVideo();
   }
 
+  async setVolume(value) {
+    this.player?.setVolume?.(Math.max(0, Math.min(100, Number(value) || 0)));
+  }
+
   async seek(seconds) {
     this.player?.seekTo(Math.max(0, Number(seconds) || 0), true);
     this.reportProgress();
@@ -168,6 +199,7 @@ export class YouTubePlayerAdapter {
   async destroy() {
     this.stopProgressUpdates();
     this.player?.destroy();
+    this.ready = false;
     this.player = null;
     this.readyPromise = null;
   }

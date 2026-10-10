@@ -1,7 +1,19 @@
+import { markPlayback, markPlaying } from "../playbackTiming";
+
+const WIDGET_OPTIONS = {
+  hide_related: true,
+  show_comments: false,
+  show_user: true,
+  show_reposts: false,
+  visual: false,
+};
+
 export class SoundCloudWidgetAdapter {
   constructor() {
     this.widget = null;
-    this.ready = false;
+    this.widgetPromise = null;
+    this.loadedUrl = null;
+    this.playToken = 0;
     this.onProgress = null;
     this.onStateChange = null;
     this.onEnded = null;
@@ -29,42 +41,71 @@ export class SoundCloudWidgetAdapter {
     const iframe = document.getElementById("soundcloud-widget");
     if (!iframe) throw new Error("SoundCloud player iframe is missing.");
 
-    const src =
+    const token = ++this.playToken;
+    const warm = Boolean(this.widgetPromise);
+    if (!warm) {
+      markPlayback("soundcloud", "adapter init start");
+      this.widgetPromise = this.createWidget(iframe, track).catch((error) => {
+        this.widgetPromise = null;
+        this.widget = null;
+        throw error;
+      });
+    }
+    await this.widgetPromise;
+    markPlayback("soundcloud", warm ? "adapter ready (already warm)" : "adapter ready");
+    if (token !== this.playToken) return;
+
+    if (this.loadedUrl !== track.url) {
+      markPlayback("soundcloud", "load start");
+      this.loadedUrl = track.url;
+      await new Promise((resolve) => {
+        this.widget.load(track.url, { ...WIDGET_OPTIONS, auto_play: false, callback: resolve });
+      });
+      if (token !== this.playToken) return;
+    }
+    markPlayback("soundcloud", "track loaded");
+
+    this.widget.getDuration((duration) => {
+      this.duration = duration || 0;
+      this.emitProgress(0);
+    });
+    this.widget.play();
+    markPlayback("soundcloud", "play command sent", { command: true });
+  }
+
+  createWidget(iframe, track) {
+    this.loadedUrl = track.url;
+    iframe.src =
       "https://w.soundcloud.com/player/?url=" +
       encodeURIComponent(track.url) +
       "&auto_play=false&hide_related=true&show_comments=false&show_user=true&show_reposts=false&visual=false";
-
-    if (iframe.src !== src) {
-      iframe.src = src;
-      await new Promise((resolve) => setTimeout(resolve, 250));
-    }
-
     this.widget = window.SC.Widget(iframe);
-    await new Promise((resolve) => {
+    return new Promise((resolve) => {
       this.widget.bind(window.SC.Widget.Events.READY, () => {
-        this.ready = true;
-        this.widget.getDuration((duration) => {
-          this.duration = duration || 0;
-          this.emitProgress(0);
-        });
-        this.widget.bind(window.SC.Widget.Events.PLAY, () => this.onStateChange?.(true));
-        this.widget.bind(window.SC.Widget.Events.PAUSE, () => this.onStateChange?.(false));
-        this.widget.bind(window.SC.Widget.Events.FINISH, () => {
-          this.onStateChange?.(false);
-          this.emitProgress(this.duration);
-          this.onEnded?.();
-        });
-        this.widget.bind(window.SC.Widget.Events.PLAY_PROGRESS, (event) => {
-          const now = Date.now();
-          if (now - this.lastProgressAt < 400) return;
-          this.lastProgressAt = now;
-          this.emitProgress(event.currentPosition || 0);
-        });
+        this.bindWidgetEvents();
         resolve();
       });
     });
+  }
 
-    this.widget.play();
+  bindWidgetEvents() {
+    const { Events } = window.SC.Widget;
+    this.widget.bind(Events.PLAY, () => {
+      this.onStateChange?.(true);
+      markPlaying("soundcloud");
+    });
+    this.widget.bind(Events.PAUSE, () => this.onStateChange?.(false));
+    this.widget.bind(Events.FINISH, () => {
+      this.onStateChange?.(false);
+      this.emitProgress(this.duration);
+      this.onEnded?.();
+    });
+    this.widget.bind(Events.PLAY_PROGRESS, (event) => {
+      const now = Date.now();
+      if (now - this.lastProgressAt < 400) return;
+      this.lastProgressAt = now;
+      this.emitProgress(event.currentPosition || 0);
+    });
   }
 
   emitProgress(position) {
@@ -87,9 +128,8 @@ export class SoundCloudWidgetAdapter {
   }
 
   async stop() {
+    this.playToken += 1;
     this.widget?.pause();
-    this.widget = null;
-    this.ready = false;
     this.duration = 0;
     this.onStateChange?.(false);
     this.onProgress?.({ currentTime: 0, duration: 0 });

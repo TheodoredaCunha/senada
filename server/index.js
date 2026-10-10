@@ -1068,22 +1068,67 @@ app.get("/api/spotify/saved-tracks", (req, res) =>
   }, "Unable to load your Spotify saved tracks."));
 
 app.post("/api/spotify/player/play", (req, res) => {
-  const { device_id, uri } = req.body || {};
+  const { device_id, uri, transfer } = req.body || {};
   if (!device_id || typeof uri !== "string" || !/^spotify:track:[A-Za-z0-9]+$/.test(uri)) {
     return res.status(400).json({ error: "A Spotify device and valid track URI are required." });
   }
   return withSpotifySession(req, res, async (_session, accessToken) => {
-    await fetchSpotifyJson("https://api.spotify.com/v1/me/player", accessToken, {
-      method: "PUT",
-      body: JSON.stringify({ device_ids: [device_id], play: true }),
-    });
-    await fetchSpotifyJson(
+    const startPlayback = () => fetchSpotifyJson(
       `https://api.spotify.com/v1/me/player/play?device_id=${encodeURIComponent(device_id)}`,
       accessToken,
       { method: "PUT", body: JSON.stringify({ uris: [uri] }) }
     );
+    const transferPlayback = () => fetchSpotifyJson("https://api.spotify.com/v1/me/player", accessToken, {
+      method: "PUT",
+      body: JSON.stringify({ device_ids: [device_id], play: false }),
+    });
+    // A freshly ready SDK device can take a moment to appear in Spotify's device list.
+    const retryOn404 = async (action) => {
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await action();
+        } catch (error) {
+          if (error.httpStatus !== 404 || attempt >= 5) throw error;
+          await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
+        }
+      }
+    };
+    if (transfer) await retryOn404(transferPlayback);
+    await retryOn404(startPlayback);
     return res.json({ ok: true });
   }, "Unable to start Spotify playback.");
+});
+
+app.post("/api/spotify/player/pause", (req, res) =>
+  withSpotifySession(req, res, async (_session, accessToken) => {
+    try {
+      await fetchSpotifyJson("https://api.spotify.com/v1/me/player/pause", accessToken, { method: "PUT" });
+    } catch (error) {
+      // 404: nothing is playing; 403: already paused.
+      if (error.httpStatus !== 404 && error.httpStatus !== 403) throw error;
+    }
+    return res.json({ ok: true });
+  }, "Unable to pause Spotify playback."));
+
+app.post("/api/spotify/player/resume", (req, res) =>
+  withSpotifySession(req, res, async (_session, accessToken) => {
+    await fetchSpotifyJson("https://api.spotify.com/v1/me/player/play", accessToken, { method: "PUT" });
+    return res.json({ ok: true });
+  }, "Unable to resume Spotify playback."));
+
+app.post("/api/spotify/player/seek", (req, res) => {
+  const positionMs = Math.floor(Number(req.body?.position_ms));
+  if (!Number.isFinite(positionMs) || positionMs < 0) {
+    return res.status(400).json({ error: "A valid seek position is required." });
+  }
+  return withSpotifySession(req, res, async (_session, accessToken) => {
+    await fetchSpotifyJson(
+      `https://api.spotify.com/v1/me/player/seek?position_ms=${positionMs}`,
+      accessToken,
+      { method: "PUT" }
+    );
+    return res.json({ ok: true });
+  }, "Unable to seek Spotify playback.");
 });
 
 app.post("/api/spotify/logout", (req, res) => {

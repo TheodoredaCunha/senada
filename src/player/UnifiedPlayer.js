@@ -1,3 +1,5 @@
+import { beginPlayback, markPlayback } from "./playbackTiming";
+
 export class UnifiedPlayer {
   constructor(adapters) {
     this.adapters = adapters;
@@ -8,6 +10,7 @@ export class UnifiedPlayer {
     this.onProgress = null;
     this.onPlayingChange = null;
     this.playing = false;
+    this.volume = 80;
 
     for (const [provider, adapter] of Object.entries(adapters)) {
       adapter.setOnProgress?.((progress) => {
@@ -45,10 +48,13 @@ export class UnifiedPlayer {
   }
 
   async play(track) {
+    beginPlayback(track.provider);
     const adapter = this.adapters[track.provider];
     if (!adapter) throw new Error(`No player for ${track.provider}`);
-    if (this.current && this.current.provider !== track.provider) {
-      await this.adapters[this.current.provider]?.stop();
+    markPlayback(track.provider, "provider identified");
+    // Pause every other provider without delaying the new track.
+    for (const [provider, other] of Object.entries(this.adapters)) {
+      if (provider !== track.provider) Promise.resolve(other.stop?.()).catch(() => {});
     }
     const queueIndex = this.queue.findIndex((item) => item.id === track.id);
     if (queueIndex >= 0) this.queueIndex = queueIndex;
@@ -62,7 +68,10 @@ export class UnifiedPlayer {
     this.onTrackChange?.(track);
     this.onPlayingChange?.(true);
     try {
-      return await adapter.play(track);
+      const result = await adapter.play(track);
+      // Some providers reset volume when a track loads.
+      Promise.resolve(adapter.setVolume?.(this.volume)).catch(() => {});
+      return result;
     } catch (error) {
       this.playing = false;
       this.onPlayingChange?.(false);
@@ -126,7 +135,7 @@ export class UnifiedPlayer {
   }
 
   async setVolume(value) {
-    if (!this.current) return;
-    return this.adapters[this.current.provider]?.setVolume(value);
+    this.volume = Math.max(0, Math.min(100, Number(value) || 0));
+    await Promise.allSettled(Object.values(this.adapters).map((adapter) => adapter.setVolume?.(this.volume)));
   }
 }

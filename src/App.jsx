@@ -48,6 +48,7 @@ export default function App() {
   const [mediaOpen, setMediaOpen] = useState(false);
   const [queueOpen, setQueueOpen] = useState(false);
   const [progress, setProgress] = useState({ currentTime: 0, duration: 0 });
+  const [volume, setVolume] = useState(player.volume);
   const [youtubeLikedNextPageToken, setYoutubeLikedNextPageToken] = useState(null);
   const [spotifyLikedNextOffset, setSpotifyLikedNextOffset] = useState(null);
   const [loadingMoreSpotify, setLoadingMoreSpotify] = useState(false);
@@ -156,11 +157,18 @@ export default function App() {
     }
   };
 
+  const warmUpProvider = (provider) => {
+    if (provider === "spotify" || provider === "youtube") {
+      player.adapters[provider]?.initialize?.().catch(() => {});
+    }
+  };
+
   const refreshProfile = async (provider) => {
     try {
       const user = await library.getCurrentUser(provider);
       setProfiles((previous) => ({ ...previous, [provider]: user }));
       setConnected((previous) => ({ ...previous, [provider]: Boolean(user) }));
+      if (user) warmUpProvider(provider);
       if (provider === "soundcloud") await loadSoundCloudLibrary();
       if (provider === "youtube") await loadYouTubeLibrary();
       if (provider === "spotify") await loadSpotifyLibrary();
@@ -196,6 +204,7 @@ export default function App() {
     if (result?.user) {
       setProfiles((previous) => ({ ...previous, [provider]: result.user }));
       setConnected((previous) => ({ ...previous, [provider]: true }));
+      warmUpProvider(provider);
       setMessage(`${providerMeta[provider].name} connected.`);
       if (provider === "soundcloud") await loadSoundCloudLibrary();
       if (provider === "youtube") await loadYouTubeLibrary();
@@ -356,6 +365,12 @@ export default function App() {
     }
   };
 
+  const changeVolume = (event) => {
+    const value = Number(event.target.value);
+    setVolume(value);
+    player.setVolume(value);
+  };
+
   const togglePlayback = async () => {
     try { await player.togglePlayback(); } catch (error) { setMessage(error.message); }
   };
@@ -435,9 +450,6 @@ export default function App() {
         {message && <div className="message" role="status">{message}</div>}
 
         <section className={`media-stage ${mediaOpen ? "expanded" : "collapsed"}`} id="now-playing-media" aria-label="Now playing media">
-          <div className={`media-artwork ${current?.provider === "youtube" ? "hidden" : ""}`}>
-            {current?.artwork ? <img src={current.artwork} alt={`${current.title} album artwork`} /> : <span>{current ? providerMeta[current.provider]?.icon || "♫" : "♫"}</span>}
-          </div>
           <div className={`youtube-player-shell ${current?.provider === "youtube" && mediaOpen ? "visible" : "hidden"}`}>
             <div id="youtube-player" />
           </div>
@@ -490,7 +502,6 @@ export default function App() {
 
         <div className="player-bar">
           <div className="now-playing">
-            <div className="mini-cover">{current?.artwork ? <img src={current.artwork} alt="" /> : current ? providerMeta[current.provider]?.icon || "♫" : "♫"}</div>
             <div><strong>{current?.title ?? "Nothing playing"}</strong><span>{current?.artist ?? "Choose a track"}</span></div>
           </div>
           <div className="controls">
@@ -499,7 +510,10 @@ export default function App() {
             <button onClick={skipNext} disabled={!current || player.queueIndex < 0 || player.queueIndex >= player.queue.length - 1} aria-label="Next song" title="Next song">▶|</button>
             <div className="timeline"><span>{formatTime(progress.currentTime)}</span><input type="range" min="0" max={Math.max(progress.duration, 1)} step="0.1" value={Math.min(progress.currentTime, progress.duration || 0)} onChange={seekTo} disabled={!current || !progress.duration} aria-label="Seek through song" /><span>{formatTime(progress.duration)}</span></div>
           </div>
-          <div className="player-provider">{current ? providerMeta[current.provider]?.name : "Universal Player"}</div>
+          <div className="player-provider">
+            <span>{current ? providerMeta[current.provider]?.name : "Universal Player"}</span>
+            <label className="volume"><span aria-hidden="true">{volume === 0 ? "🔇" : "🔊"}</span><input type="range" min="0" max="100" value={volume} onChange={changeVolume} aria-label="Volume" /></label>
+          </div>
         </div>
       </main>
     </div>

@@ -495,6 +495,7 @@ h2 {
   left: 260px;
   right: 0;
   bottom: 0;
+  z-index: 20;
   min-height: 92px;
   border-top: 1px solid #29292e;
   background: rgba(13, 13, 15, 0.97);
@@ -593,6 +594,17 @@ h2 {
   text-align: right;
   color: #777780;
   font-size: 11px;
+}
+
+.volume {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.volume input[type="range"] {
+  width: 90px;
+  accent-color: #fff;
 }
 
 .soundcloud-iframe {
