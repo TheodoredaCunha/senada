@@ -1,4 +1,3 @@
-import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import dotenv from "dotenv";
@@ -6,10 +5,18 @@ import express from "express";
 
 dotenv.config({ path: path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../.env") });
 
+// Loaded after dotenv so database/encryption settings from .env are visible.
+const { attachUser, registerAppAuth } = await import("./appAuth.js");
+const { createPlaylistRouter } = await import("./playlists.js");
+const {
+  disconnectProvider,
+  getProviderSession,
+  invalidateProviderSession,
+  persistProviderSession,
+} = await import("./providerSessions.js");
+
 const app = express();
 const port = Number(process.env.PORT || 3001);
-const SESSION_COOKIE = "soundcloud_session";
-const sessions = new Map();
 
 app.use(express.json({ limit: "1mb" }));
 app.use(
@@ -18,6 +25,7 @@ app.use(
     limit: "1mb",
   })
 );
+app.use(attachUser);
 
 function normalizeLocalRedirectUri(value, fallback) {
   const redirectUri = new URL(value || fallback);
@@ -41,47 +49,24 @@ function getClientConfig() {
   return { clientId, clientSecret, redirectUri };
 }
 
-function getSessionId(req) {
-  const cookieHeader = req.headers.cookie || "";
-  const match = cookieHeader
-    .split(";")
-    .map((part) => part.trim())
-    .find((part) => part.startsWith(`${SESSION_COOKIE}=`));
-
-  return match ? decodeURIComponent(match.split("=")[1]) : null;
+function getSession(req) {
+  return getProviderSession(req.user, "soundcloud");
 }
 
-function ensureSession(req, res) {
-  const existing = getSessionId(req);
-  if (existing && sessions.has(existing)) {
-    return existing;
-  }
-
-  const sessionId = crypto.randomBytes(24).toString("hex");
-  res.cookie(SESSION_COOKIE, sessionId, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: false,
-    maxAge: 1000 * 60 * 60 * 24 * 7,
-  });
-
-  return sessionId;
+// Expired or revoked authorization: flag the connection for reconnecting, keep the app account.
+function deleteSession(req) {
+  invalidateProviderSession(req.user, "soundcloud");
 }
 
-function getSession(req, res) {
-  const sessionId = ensureSession(req, res);
-  if (!sessions.has(sessionId)) {
-    sessions.set(sessionId, { createdAt: Date.now() });
-  }
-  return sessions.get(sessionId);
-}
+const SOUNDCLOUD_EXPIRED = "SoundCloud connection expired.";
 
-function deleteSession(req, res) {
-  const sessionId = getSessionId(req);
-  if (sessionId) {
-    sessions.delete(sessionId);
+// Only an expired connection is invalidated; a transient API failure must not unlink the account.
+function failSoundCloud(req, res, error, message) {
+  if (error.message === SOUNDCLOUD_EXPIRED) {
+    deleteSession(req);
+    return res.status(401).json({ error: SOUNDCLOUD_EXPIRED });
   }
-  res.clearCookie(SESSION_COOKIE);
+  return res.status(502).json({ error: message });
 }
 
 async function fetchJson(url, headers = {}) {
@@ -170,6 +155,7 @@ async function refreshAccessToken(session) {
   session.access_token = tokenResponse.access_token;
   session.refresh_token = tokenResponse.refresh_token || session.refresh_token;
   session.expires_at = Date.now() + Number(tokenResponse.expires_in || 3600) * 1000;
+  persistProviderSession(session);
 
   return session.access_token;
 }
@@ -218,7 +204,6 @@ async function fetchPaginatedCollection(url, accessToken) {
   return items;
 }
 
-const YOUTUBE_SESSION_COOKIE = "youtube_session";
 const YOUTUBE_SCOPE = "https://www.googleapis.com/auth/youtube.readonly";
 
 function getYouTubeConfig() {
@@ -232,35 +217,12 @@ function getYouTubeConfig() {
   };
 }
 
-function getCookieValue(req, cookieName) {
-  const prefix = `${cookieName}=`;
-  const cookie = (req.headers.cookie || "")
-    .split(";")
-    .map((part) => part.trim())
-    .find((part) => part.startsWith(prefix));
-  return cookie ? decodeURIComponent(cookie.slice(prefix.length)) : null;
+function getYouTubeSession(req) {
+  return getProviderSession(req.user, "youtube");
 }
 
-function getYouTubeSession(req, res) {
-  let sessionId = getCookieValue(req, YOUTUBE_SESSION_COOKIE);
-  if (!sessionId || !sessions.has(sessionId)) {
-    sessionId = crypto.randomBytes(32).toString("hex");
-    res.cookie(YOUTUBE_SESSION_COOKIE, sessionId, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      maxAge: 1000 * 60 * 60 * 24 * 7,
-      path: "/",
-    });
-    sessions.set(sessionId, { createdAt: Date.now() });
-  }
-  return sessions.get(sessionId);
-}
-
-function clearYouTubeSession(req, res) {
-  const sessionId = getCookieValue(req, YOUTUBE_SESSION_COOKIE);
-  if (sessionId) sessions.delete(sessionId);
-  res.clearCookie(YOUTUBE_SESSION_COOKIE, { path: "/" });
+function clearYouTubeSession(req) {
+  invalidateProviderSession(req.user, "youtube");
 }
 
 function assertYouTubeConfig() {
@@ -327,6 +289,7 @@ async function refreshYouTubeAccessToken(session) {
   session.access_token = tokenResponse.access_token;
   session.refresh_token = tokenResponse.refresh_token || session.refresh_token;
   session.expires_at = Date.now() + Number(tokenResponse.expires_in || 3600) * 1000;
+  persistProviderSession(session);
   return session.access_token;
 }
 
@@ -340,6 +303,7 @@ async function ensureValidYouTubeSession(session) {
       session.refresh_token = null;
       session.expires_at = null;
       session.user = null;
+      persistProviderSession(session);
       throw new Error("YouTube connection expired.");
     }
   }
@@ -373,8 +337,6 @@ async function withYouTubeSession(req, res, handler, failureMessage) {
   }
 }
 
-const SPOTIFY_SESSION_COOKIE = "spotify_session";
-
 function getSpotifyConfig() {
   return {
     clientId: process.env.SPOTIFY_CLIENT_ID || process.env.VITE_SPOTIFY_CLIENT_ID,
@@ -385,26 +347,12 @@ function getSpotifyConfig() {
   };
 }
 
-function getSpotifySession(req, res) {
-  let sessionId = getCookieValue(req, SPOTIFY_SESSION_COOKIE);
-  if (!sessionId || !sessions.has(sessionId)) {
-    sessionId = crypto.randomBytes(32).toString("hex");
-    res.cookie(SPOTIFY_SESSION_COOKIE, sessionId, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      maxAge: 1000 * 60 * 60 * 24 * 7,
-      path: "/",
-    });
-    sessions.set(sessionId, { createdAt: Date.now() });
-  }
-  return sessions.get(sessionId);
+function getSpotifySession(req) {
+  return getProviderSession(req.user, "spotify");
 }
 
-function clearSpotifySession(req, res) {
-  const sessionId = getCookieValue(req, SPOTIFY_SESSION_COOKIE);
-  if (sessionId) sessions.delete(sessionId);
-  res.clearCookie(SPOTIFY_SESSION_COOKIE, { path: "/" });
+function clearSpotifySession(req) {
+  invalidateProviderSession(req.user, "spotify");
 }
 
 function assertSpotifyConfig() {
@@ -521,6 +469,7 @@ async function refreshSpotifyAccessToken(session) {
   session.access_token = payload.access_token;
   session.refresh_token = payload.refresh_token || session.refresh_token;
   session.expires_at = Date.now() + Number(payload.expires_in || 3600) * 1000;
+  persistProviderSession(session);
   return session.access_token;
 }
 
@@ -534,6 +483,7 @@ async function ensureValidSpotifySession(session) {
       session.refresh_token = null;
       session.expires_at = null;
       session.user = null;
+      persistProviderSession(session);
       throw new Error("Spotify connection expired.");
     }
   }
@@ -613,6 +563,16 @@ app.get("/api/health", (_req, res) => {
   res.json({ ok: true });
 });
 
+registerAppAuth(app);
+app.use("/api/playlists", createPlaylistRouter());
+
+// Provider links belong to a signed-in Universal Music user.
+app.use(["/api/soundcloud", "/api/youtube", "/api/spotify"], (req, res, next) => {
+  if (req.user) return next();
+  if (req.method === "GET" && req.path === "/session") return res.json({ connected: false });
+  return res.status(401).json({ error: "Sign in to Universal Music first." });
+});
+
 app.post("/api/soundcloud/oauth/prepare", (req, res) => {
   const session = getSession(req, res);
   const { state, code_verifier } = req.body || {};
@@ -665,6 +625,7 @@ app.post("/api/soundcloud/oauth/callback", async (req, res) => {
     session.user = await fetchMe(session.access_token);
     session.state = null;
     session.code_verifier = null;
+    persistProviderSession(session);
 
     return res.json({ ok: true, connected: true, user: session.user });
   } catch (error) {
@@ -689,8 +650,11 @@ app.get("/api/soundcloud/session", async (req, res) => {
 
     return res.json({ connected: true, user: session.user });
   } catch (error) {
-    deleteSession(req, res);
-    return res.json({ connected: false, error: "SoundCloud connection expired." });
+    if (error.message === SOUNDCLOUD_EXPIRED) {
+      deleteSession(req);
+      return res.json({ connected: false, error: SOUNDCLOUD_EXPIRED });
+    }
+    return res.status(502).json({ error: "Unable to restore your SoundCloud session." });
   }
 });
 
@@ -702,8 +666,7 @@ app.get("/api/soundcloud/me", async (req, res) => {
     session.user = session.user || (await fetchMe(accessToken));
     return res.json({ connected: true, user: session.user });
   } catch (error) {
-    deleteSession(req, res);
-    return res.status(401).json({ error: "SoundCloud connection expired." });
+    return failSoundCloud(req, res, error, "Unable to load your SoundCloud account.");
   }
 });
 
@@ -719,8 +682,7 @@ app.get("/api/soundcloud/likes/tracks", async (req, res) => {
 
     return res.json({ connected: true, tracks: likedItems });
   } catch (error) {
-    deleteSession(req, res);
-    return res.status(401).json({ error: "Unable to load your SoundCloud liked songs." });
+    return failSoundCloud(req, res, error, "Unable to load your SoundCloud liked songs.");
   }
 });
 
@@ -736,8 +698,7 @@ app.get("/api/soundcloud/playlists", async (req, res) => {
 
     return res.json({ connected: true, playlists });
   } catch (error) {
-    deleteSession(req, res);
-    return res.status(401).json({ error: "Unable to load your SoundCloud playlists." });
+    return failSoundCloud(req, res, error, "Unable to load your SoundCloud playlists.");
   }
 });
 
@@ -757,13 +718,12 @@ app.get("/api/soundcloud/playlists/:playlistId/tracks", async (req, res) => {
     const tracks = Array.isArray(playlist.tracks) ? playlist.tracks : [];
     return res.json({ connected: true, tracks });
   } catch (error) {
-    deleteSession(req, res);
-    return res.status(401).json({ error: "Unable to load that SoundCloud playlist." });
+    return failSoundCloud(req, res, error, "Unable to load that SoundCloud playlist.");
   }
 });
 
 app.post("/api/soundcloud/logout", (req, res) => {
-  deleteSession(req, res);
+  disconnectProvider(req.user, "soundcloud");
   return res.json({ ok: true, disconnected: true });
 });
 
@@ -816,6 +776,7 @@ app.post("/api/youtube/oauth/callback", async (req, res) => {
     session.user = await fetchYouTubeUser(session.access_token);
     session.state = null;
     session.code_verifier = null;
+    persistProviderSession(session);
     return res.json({ connected: true, user: session.user });
   } catch (error) {
     session.state = null;
@@ -890,7 +851,7 @@ app.get("/api/youtube/playlists/:playlistId/videos", (req, res) =>
   }, "Unable to load videos from that YouTube playlist."));
 
 app.post("/api/youtube/logout", (req, res) => {
-  clearYouTubeSession(req, res);
+  disconnectProvider(req.user, "youtube");
   return res.json({ ok: true, disconnected: true });
 });
 
@@ -914,7 +875,7 @@ app.post("/api/spotify/oauth/prepare", (req, res) => {
 app.post("/api/spotify/oauth/callback", async (req, res) => {
   const session = getSpotifySession(req, res);
   const { code, state } = req.body || {};
-  const cookiePresent = Boolean(getCookieValue(req, SPOTIFY_SESSION_COOKIE));
+  const cookiePresent = Boolean(req.user);
   let stage = "request_validation";
   const clearPendingOAuth = () => {
     session.state = null;
@@ -1004,6 +965,7 @@ app.post("/api/spotify/oauth/callback", async (req, res) => {
     stage = "profile_request";
     session.user = await fetchSpotifyJson("https://api.spotify.com/v1/me", session.access_token);
     clearPendingOAuth();
+    persistProviderSession(session);
     return res.json({ connected: true, user: session.user });
   } catch (error) {
     logSpotifyOAuthDiagnostic(error.spotifyStage || stage, {
@@ -1132,7 +1094,7 @@ app.post("/api/spotify/player/seek", (req, res) => {
 });
 
 app.post("/api/spotify/logout", (req, res) => {
-  clearSpotifySession(req, res);
+  disconnectProvider(req.user, "spotify");
   return res.json({ ok: true, disconnected: true });
 });
 

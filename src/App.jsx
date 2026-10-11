@@ -4,6 +4,7 @@ import { SpotifyCallbackPage } from "./auth/spotify/CallbackPage";
 import { YouTubeCallbackPage } from "./auth/youtube/CallbackPage";
 import { createPlayer } from "./player/createPlayer";
 import { MediaView } from "./MediaView";
+import { playlistsApi } from "./playlists/playlistsApi";
 import { auth, library } from "./providers";
 
 const providerMeta = {
@@ -12,17 +13,6 @@ const providerMeta = {
   youtube: { name: "YouTube", icon: "▶", className: "youtube" },
 };
 
-const APP_PLAYLISTS_KEY = "universal-music:playlists";
-
-function readAppPlaylists() {
-  try {
-    const playlists = JSON.parse(localStorage.getItem(APP_PLAYLISTS_KEY) || "[]");
-    return Array.isArray(playlists) ? playlists : [];
-  } catch {
-    return [];
-  }
-}
-
 function formatTime(seconds) {
   if (!Number.isFinite(seconds) || seconds < 0) return "0:00";
   const minutes = Math.floor(seconds / 60);
@@ -30,7 +20,7 @@ function formatTime(seconds) {
   return `${minutes}:${remainingSeconds}`;
 }
 
-export default function App() {
+export default function App({ account, onAccountChange, onOpenSetup, onSignOut }) {
   const player = useMemo(() => createPlayer(auth.providers.spotify), []);
   const [connected, setConnected] = useState({
     soundcloud: auth.isConnected("soundcloud"),
@@ -40,7 +30,7 @@ export default function App() {
   const [profiles, setProfiles] = useState({ soundcloud: null, spotify: null, youtube: null });
   const [soundcloudPlaylists, setSoundcloudPlaylists] = useState([]);
   const [youtubePlaylists, setYoutubePlaylists] = useState([]);
-  const [appPlaylists, setAppPlaylists] = useState(readAppPlaylists);
+  const [appPlaylists, setAppPlaylists] = useState([]);
   const [newPlaylistName, setNewPlaylistName] = useState("");
   const [playlist, setPlaylist] = useState("all-liked");
   const [tracks, setTracks] = useState([]);
@@ -69,35 +59,94 @@ export default function App() {
     return libraryRequestId.current;
   };
 
-  const createAppPlaylist = (event) => {
+  const currentAppPlaylistId = playlist.startsWith("app-playlist:") ? playlist.replace("app-playlist:", "") : null;
+
+  const createAppPlaylist = async (event) => {
     event.preventDefault();
-    const title = newPlaylistName.trim();
-    if (!title) return;
-    const createdPlaylist = {
-      id: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-      title,
-      tracks: [],
-    };
-    const updatedPlaylists = [...appPlaylists, createdPlaylist];
-    localStorage.setItem(APP_PLAYLISTS_KEY, JSON.stringify(updatedPlaylists));
-    setAppPlaylists(updatedPlaylists);
-    setNewPlaylistName("");
-    setMessage(`Created playlist “${title}”.`);
+    const name = newPlaylistName.trim();
+    if (!name) return;
+    try {
+      const created = await playlistsApi.create(name);
+      setAppPlaylists((previous) => [...previous, created]);
+      setNewPlaylistName("");
+      setMessage(`Created playlist “${name}”.`);
+    } catch (error) {
+      setMessage(error.message);
+    }
   };
 
-  const addTrackToAppPlaylist = (playlistId, track) => {
+  const addTrackToAppPlaylist = async (playlistId, track) => {
     const targetPlaylist = appPlaylists.find((item) => item.id === playlistId);
     if (!targetPlaylist) return;
-    if (targetPlaylist.tracks.some((item) => item.id === track.id)) {
-      setMessage(`${track.title} is already in ${targetPlaylist.title}.`);
-      return;
+    try {
+      const saved = await playlistsApi.addTrack(playlistId, track);
+      setAppPlaylists((previous) => previous.map((item) =>
+        item.id === playlistId ? { ...item, trackCount: (item.trackCount || 0) + 1 } : item));
+      if (currentAppPlaylistId === playlistId) setTracks((previous) => [...previous, saved]);
+      setMessage(`Added ${track.title} to ${targetPlaylist.title}.`);
+    } catch (error) {
+      setMessage(error.status === 409 ? `${track.title} is already in ${targetPlaylist.title}.` : error.message);
     }
-    const updatedPlaylists = appPlaylists.map((item) =>
-      item.id === playlistId ? { ...item, tracks: [...item.tracks, track] } : item
-    );
-    localStorage.setItem(APP_PLAYLISTS_KEY, JSON.stringify(updatedPlaylists));
-    setAppPlaylists(updatedPlaylists);
-    setMessage(`Added ${track.title} to ${targetPlaylist.title}.`);
+  };
+
+  const renameAppPlaylist = async () => {
+    const target = appPlaylists.find((item) => item.id === currentAppPlaylistId);
+    const name = target && window.prompt("Rename playlist", target.title)?.trim();
+    if (!name || name === target.title) return;
+    try {
+      const updated = await playlistsApi.rename(target.id, name);
+      setAppPlaylists((previous) => previous.map((item) => (item.id === updated.id ? { ...item, ...updated } : item)));
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const deleteAppPlaylist = async () => {
+    const target = appPlaylists.find((item) => item.id === currentAppPlaylistId);
+    if (!target || !window.confirm(`Delete “${target.title}”? This can't be undone.`)) return;
+    try {
+      await playlistsApi.remove(target.id);
+      setAppPlaylists((previous) => previous.filter((item) => item.id !== target.id));
+      setPlaylist("all-liked");
+      setTracks([]);
+      setMessage(`Deleted “${target.title}”.`);
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const removeFromAppPlaylist = async (track) => {
+    try {
+      await playlistsApi.removeTrack(currentAppPlaylistId, track.playlistTrackId);
+      const remaining = tracks.filter((item) => item.playlistTrackId !== track.playlistTrackId);
+      setTracks(remaining);
+      player.setQueue(remaining);
+      setAppPlaylists((previous) => previous.map((item) =>
+        item.id === currentAppPlaylistId ? { ...item, trackCount: remaining.length } : item));
+    } catch (error) {
+      setMessage(error.message);
+    }
+  };
+
+  const moveInAppPlaylist = async (index, offset) => {
+    const target = index + offset;
+    if (target < 0 || target >= tracks.length) return;
+    const reordered = [...tracks];
+    [reordered[index], reordered[target]] = [reordered[target], reordered[index]];
+    setTracks(reordered);
+    player.setQueue(reordered);
+    try {
+      await playlistsApi.reorder(currentAppPlaylistId, reordered.map((item) => item.playlistTrackId));
+    } catch (error) {
+      setMessage(error.message);
+      setTracks(tracks);
+      player.setQueue(tracks);
+    }
+  };
+
+  const queuePlaylist = () => {
+    player.setQueue(tracks);
+    setMessage(`Queued ${tracks.length} tracks.`);
   };
 
   const loadSoundCloudLibrary = async () => {
@@ -170,6 +219,7 @@ export default function App() {
       setProfiles((previous) => ({ ...previous, [provider]: user }));
       setConnected((previous) => ({ ...previous, [provider]: Boolean(user) }));
       if (user) warmUpProvider(provider);
+      else onAccountChange?.();
       if (provider === "soundcloud") await loadSoundCloudLibrary();
       if (provider === "youtube") await loadYouTubeLibrary();
       if (provider === "spotify") await loadSpotifyLibrary();
@@ -192,6 +242,7 @@ export default function App() {
     if (auth.isConnected("soundcloud")) refreshProfile("soundcloud");
     if (auth.isConnected("youtube")) refreshProfile("youtube");
     if (auth.isConnected("spotify")) refreshProfile("spotify");
+    playlistsApi.list().then(setAppPlaylists).catch((error) => setMessage(error.message));
   }, []);
 
   const clearCallbackPath = () => window.history.replaceState({}, "", "/");
@@ -200,6 +251,7 @@ export default function App() {
     if (result instanceof Error) {
       setMessage(result.message);
       clearCallbackPath();
+      onAccountChange?.();
       return;
     }
     if (result?.user) {
@@ -212,6 +264,7 @@ export default function App() {
       if (provider === "spotify") await loadSpotifyLibrary();
     }
     clearCallbackPath();
+    onAccountChange?.();
   };
 
   const soundCloudCallback = window.location.pathname === "/auth/soundcloud/callback";
@@ -222,10 +275,10 @@ export default function App() {
     return <SoundCloudCallbackPage onComplete={(result) => handleCallbackComplete("soundcloud", result)} onError={(error) => setMessage(error.message)} />;
   }
   if (youtubeCallback) {
-    return <YouTubeCallbackPage onComplete={(result) => handleCallbackComplete("youtube", result)} onError={(error) => { setMessage(error.message); clearCallbackPath(); }} />;
+    return <YouTubeCallbackPage onComplete={(result) => handleCallbackComplete("youtube", result)} onError={(error) => { setMessage(error.message); clearCallbackPath(); onAccountChange?.(); }} />;
   }
   if (spotifyCallback) {
-    return <SpotifyCallbackPage onComplete={(result) => handleCallbackComplete("spotify", result)} onError={(error) => { setMessage(error.message); clearCallbackPath(); }} />;
+    return <SpotifyCallbackPage onComplete={(result) => handleCallbackComplete("spotify", result)} onError={(error) => { setMessage(error.message); clearCallbackPath(); onAccountChange?.(); }} />;
   }
 
   const loadPlaylist = async (id) => {
@@ -254,7 +307,7 @@ export default function App() {
         result = page.tracks;
         if (requestId === libraryRequestId.current) setSpotifyLikedNextOffset(page.nextOffset);
       } else if (id.startsWith("app-playlist:")) {
-        result = appPlaylists.find((item) => item.id === id.replace("app-playlist:", ""))?.tracks || [];
+        result = (await playlistsApi.get(id.replace("app-playlist:", ""))).tracks;
       } else {
         result = [];
       }
@@ -329,6 +382,7 @@ export default function App() {
           setSpotifyLikedNextOffset(null);
         }
         setMessage(`${providerMeta[provider].name} disconnected.`);
+        onAccountChange?.();
       } catch (error) {
         setMessage(error.message);
       }
@@ -401,12 +455,23 @@ export default function App() {
         <div className="brand-sub">MUSIC</div>
         <section className="side-section">
           <div className="section-label">ACCOUNTS</div>
-          {Object.entries(providerMeta).map(([key, provider]) => (
-            <button className={`account ${provider.className}`} key={key} onClick={() => handleLogin(key)} title={connected[key] ? `Disconnect ${provider.name}` : `Connect ${provider.name}`}>
-              <span>{provider.icon}</span><span>{provider.name}</span>
-              <span className="status">{connected[key] ? key === "spotify" ? "Disconnect" : "Connected" : "Connect"}</span>
-            </button>
-          ))}
+          {account && <div className="user-row">
+            {account.user.avatarUrl ? <img src={account.user.avatarUrl} alt="" referrerPolicy="no-referrer" /> : <span className="user-initial" aria-hidden="true">{account.user.displayName.slice(0, 1)}</span>}
+            <div><div className="profile-name">{account.user.displayName}</div><small>Google ✓</small></div>
+          </div>}
+          {Object.entries(providerMeta).map(([key, provider]) => {
+            const needsReconnect = !connected[key] && account?.providerStatus?.[key] === "needs_reconnect";
+            return (
+              <button className={`account ${provider.className}`} key={key} onClick={() => handleLogin(key)} title={connected[key] ? `Disconnect ${provider.name}` : needsReconnect ? `Reconnect ${provider.name}` : `Connect ${provider.name}`}>
+                <span>{provider.icon}</span><span>{provider.name}{connected[key] ? " ✓" : ""}</span>
+                <span className="status">{connected[key] ? "Disconnect" : needsReconnect ? "⚠ Reconnect" : "Connect"}</span>
+              </button>
+            );
+          })}
+          {account && <div className="account-actions">
+            <button onClick={onOpenSetup}>Connect your music</button>
+            <button onClick={onSignOut}>Log out</button>
+          </div>}
         </section>
         {connected.soundcloud && profiles.soundcloud && <div className="profile-row"><img src={profiles.soundcloud.avatar_url || "https://soundcloud.com/favicon.ico"} alt="" /><div><div className="profile-name">{profiles.soundcloud.username}</div><small>SoundCloud connected</small></div></div>}
         {connected.youtube && profiles.youtube && <div className="profile-row">{profiles.youtube.thumbnail && <img src={profiles.youtube.thumbnail} alt="" />}<div><div className="profile-name">{profiles.youtube.title}</div><small>YouTube connected</small></div></div>}
@@ -431,7 +496,7 @@ export default function App() {
             <input aria-label="New playlist name" placeholder="Playlist name" value={newPlaylistName} onChange={(event) => setNewPlaylistName(event.target.value)} maxLength={60} />
             <button type="submit" disabled={!newPlaylistName.trim()} aria-label="Create playlist" title="Create playlist">+</button>
           </form>
-          {appPlaylists.map((item) => <button key={item.id} className={playlist === `app-playlist:${item.id}` ? "nav active" : "nav"} onClick={() => loadPlaylist(`app-playlist:${item.id}`)}>♫ {item.title}<span className="playlist-count">{item.tracks.length}</span></button>)}
+          {appPlaylists.map((item) => <button key={item.id} className={playlist === `app-playlist:${item.id}` ? "nav active" : "nav"} onClick={() => loadPlaylist(`app-playlist:${item.id}`)}>♫ {item.title}<span className="playlist-count">{item.trackCount ?? 0}</span></button>)}
         </section>
       </aside>
 
@@ -461,6 +526,12 @@ export default function App() {
           <div><div className="eyebrow">CURRENT LIBRARY</div><h2>{playlistDisplayName}</h2></div>
           <div className="library-actions">
             <span>{tracks.length} tracks</span>
+            {currentAppPlaylistId && <>
+              <button className="playlist-action" onClick={() => tracks[0] && playTrack(tracks[0])} disabled={tracks.length === 0}>Play</button>
+              <button className="playlist-action" onClick={queuePlaylist} disabled={tracks.length === 0}>Queue</button>
+              <button className="playlist-action" onClick={renameAppPlaylist}>Rename</button>
+              <button className="playlist-action danger" onClick={deleteAppPlaylist}>Delete</button>
+            </>}
           </div>
         </section>
 
@@ -487,10 +558,18 @@ export default function App() {
               <span className={`provider-pill ${track.provider}`}>{providerMeta[track.provider]?.name || track.provider}</span>
               <span className="play-icon">{track.playable ? "▶" : "○"}</span>
             </button>
-            <select className="add-track-select" aria-label={`Add ${track.title} to an app playlist`} defaultValue="" disabled={appPlaylists.length === 0} onChange={(event) => { addTrackToAppPlaylist(event.target.value, track); event.target.value = ""; }}>
+            {currentAppPlaylistId ? (
+              <div className="row-actions">
+                <button onClick={() => moveInAppPlaylist(index, -1)} disabled={index === 0} aria-label={`Move ${track.title} up`} title="Move up">↑</button>
+                <button onClick={() => moveInAppPlaylist(index, 1)} disabled={index === tracks.length - 1} aria-label={`Move ${track.title} down`} title="Move down">↓</button>
+                <button onClick={() => removeFromAppPlaylist(track)} aria-label={`Remove ${track.title} from playlist`} title="Remove from playlist">✕</button>
+              </div>
+            ) : (
+              <select className="add-track-select" aria-label={`Add ${track.title} to an app playlist`} defaultValue="" disabled={appPlaylists.length === 0} onChange={(event) => { addTrackToAppPlaylist(event.target.value, track); event.target.value = ""; }}>
               <option value="" disabled>{appPlaylists.length ? "+ Playlist" : "No playlists"}</option>
               {appPlaylists.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}
             </select>
+            )}
           </div>)}
         </section>
 

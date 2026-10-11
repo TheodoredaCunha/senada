@@ -1,6 +1,6 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import App from "./App";
+import AccountGate from "./account/AccountGate";
 import "./styles.css";
 
 const spotifyCallbackOrigin = new URL(
@@ -14,7 +14,7 @@ if (import.meta.env.DEV && window.location.origin !== spotifyCallbackOrigin) {
 } else {
   ReactDOM.createRoot(document.getElementById("root")).render(
     <React.StrictMode>
-      <App />
+      <AccountGate />
     </React.StrictMode>
   );
 }
