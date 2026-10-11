@@ -3,6 +3,7 @@ import { SoundCloudCallbackPage } from "./auth/soundcloud/CallbackPage";
 import { SpotifyCallbackPage } from "./auth/spotify/CallbackPage";
 import { YouTubeCallbackPage } from "./auth/youtube/CallbackPage";
 import { createPlayer } from "./player/createPlayer";
+import { MediaView } from "./MediaView";
 import { auth, library } from "./providers";
 
 const providerMeta = {
@@ -349,7 +350,6 @@ export default function App() {
     }
     player.setQueue(tracks);
     try {
-      setMediaOpen(true);
       await player.play(track);
     } catch (error) {
       setMessage(error.message);
@@ -357,7 +357,6 @@ export default function App() {
   };
 
   const playQueuedTrack = async (track) => {
-    setMediaOpen(true);
     try {
       await player.play(track);
     } catch (error) {
@@ -449,21 +448,19 @@ export default function App() {
         </div>
         {message && <div className="message" role="status">{message}</div>}
 
-        <section className={`media-stage ${mediaOpen ? "expanded" : "collapsed"}`} id="now-playing-media" aria-label="Now playing media">
-          <div className={`youtube-player-shell ${current?.provider === "youtube" && mediaOpen ? "visible" : "hidden"}`}>
-            <div id="youtube-player" />
-          </div>
-          <iframe id="soundcloud-widget" title="SoundCloud player" allow="autoplay" className="soundcloud-iframe" />
-        </section>
+        <MediaView
+          current={current}
+          open={mediaOpen}
+          onClose={() => setMediaOpen(false)}
+          providerName={current ? providerMeta[current.provider]?.name : ""}
+          providerIcon={current ? providerMeta[current.provider]?.icon : ""}
+        />
+        <iframe id="soundcloud-widget" title="SoundCloud player" allow="autoplay" className="soundcloud-iframe" />
 
         <section className="library-header">
           <div><div className="eyebrow">CURRENT LIBRARY</div><h2>{playlistDisplayName}</h2></div>
           <div className="library-actions">
             <span>{tracks.length} tracks</span>
-            <button className={`queue-toggle ${queueOpen ? "active" : ""}`} onClick={() => setQueueOpen((open) => !open)} aria-expanded={queueOpen} aria-controls="playback-queue">Queue <span>{player.queue.length}</span></button>
-            <button className="media-toggle" onClick={() => setMediaOpen((open) => !open)} aria-expanded={mediaOpen} aria-controls="now-playing-media">
-              {mediaOpen ? "Hide media" : "Show media"}
-            </button>
           </div>
         </section>
 
@@ -510,9 +507,17 @@ export default function App() {
             <button onClick={skipNext} disabled={!current || player.queueIndex < 0 || player.queueIndex >= player.queue.length - 1} aria-label="Next song" title="Next song">▶|</button>
             <div className="timeline"><span>{formatTime(progress.currentTime)}</span><input type="range" min="0" max={Math.max(progress.duration, 1)} step="0.1" value={Math.min(progress.currentTime, progress.duration || 0)} onChange={seekTo} disabled={!current || !progress.duration} aria-label="Seek through song" /><span>{formatTime(progress.duration)}</span></div>
           </div>
-          <div className="player-provider">
-            <span>{current ? providerMeta[current.provider]?.name : "Universal Player"}</span>
-            <label className="volume"><span aria-hidden="true">{volume === 0 ? "🔇" : "🔊"}</span><input type="range" min="0" max="100" value={volume} onChange={changeVolume} aria-label="Volume" /></label>
+          <div className="player-right">
+            <div className="player-provider">
+              <span>{current ? providerMeta[current.provider]?.name : "Universal Player"}</span>
+              <label className="volume"><span aria-hidden="true">{volume === 0 ? "🔇" : "🔊"}</span><input type="range" min="0" max="100" value={volume} onChange={changeVolume} aria-label="Volume" /></label>
+            </div>
+            <div className="player-actions">
+              <button className={`queue-toggle ${queueOpen ? "active" : ""}`} onClick={() => setQueueOpen((open) => !open)} aria-expanded={queueOpen} aria-controls="playback-queue">Queue <span>{player.queue.length}</span></button>
+              <button className={`media-toggle ${mediaOpen ? "active" : ""}`} onClick={() => setMediaOpen((open) => !open)} aria-expanded={mediaOpen} aria-controls="now-playing-media">
+                {mediaOpen ? "Hide media" : "Show media"}
+              </button>
+            </div>
           </div>
         </div>
       </main>
